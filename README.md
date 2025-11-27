@@ -15,7 +15,7 @@
 ## 📦 วิธีติดตั้ง (Installation)
 
 1.  ใช้ลิงก์ติดตั้งลงใน extension
-    `SillyTavern/public/scripts/extensions/html-healer`
+    `[SillyTavern/public/scripts/extensions/html-healer](https://github.com/Ze4llaboizeng/SillyTavern-FixHTML-release/tree/main)`
 2.  รีโหลดหน้าเว็บ SillyTavern
 3.  เปิดเมนู Extensions จะเจอเมนู **HTML Healer**
 
