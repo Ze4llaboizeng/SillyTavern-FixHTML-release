@@ -1,117 +1,111 @@
 const extensionName = "html-healer";
 
+// --- 1. Logic (Analysis & Fix) ---
+
 let initialSegments = []; 
 let currentSegments = []; 
 
-// แยกส่วนประกอบ (ใช้สำหรับหน้า Editor)
+const authorConfig = {
+    name: "Zealllll",
+    avatarUrl: "scripts/extensions/third-party/SillyTavern-FixHTML-release/avatar.png"
+};
+
+// แยกส่วนประกอบ: ตัด UI ออก เหลือแค่ Think / Story
 function parseSegments(rawText) {
-    if (!rawText) return [];
+    if (!rawText) return { segments: [], isThinkBroken: false };
+    
     let cleanText = rawText
         .replace(/&lt;think&gt;/gi, "<think>")
         .replace(/&lt;\/think&gt;/gi, "</think>");
 
-    const rawBlocks = cleanText.split(/\n/).filter(line => line.trim() !== "");
+    const rawBlocks = cleanText.split(/\n/);
     
-    let isThinking = false;
-    let hasFoundStoryStart = false;
+    const hasOpenThink = /<think>/i.test(cleanText);
+    const hasCloseThink = /<\/think>/i.test(cleanText);
+    const isThinkBroken = hasOpenThink && !hasCloseThink;
 
-    return rawBlocks.map((block, index) => {
-        let text = block.trim();
-        
-        // เช็คคร่าวๆ ว่าเป็น Tag เปิดยาวๆ หรือไม่
-        const startsWithComplexTag = /^<[^/](?!br|i|b|em|strong|span|p)[^>]*>?/i.test(text);
-        const hasCloseThink = /<\/think>|Close COT|End of thought/i.test(text);
-        
-        let assignedType = 'story'; 
+    let state = 'story'; 
+    let segments = [];
+    
+    // ถ้า Think พัง (มีเปิดไม่มีปิด) ให้ตั้งต้นเป็น Think ไปก่อนเพื่อให้คนมากดเลือกจุดจบเอง
+    if (isThinkBroken) state = 'think';
 
-        if (!hasFoundStoryStart) {
-            if (startsWithComplexTag || /<think>/i.test(text) || isThinking) {
-                assignedType = 'think';
-                isThinking = true;
-            }
-            if (hasCloseThink) {
-                isThinking = false;
-                hasFoundStoryStart = true;
-                assignedType = 'think';
-            }
-        } else {
-            assignedType = 'story';
+    rawBlocks.forEach((line, index) => {
+        let text = line.trim();
+        if (text === "") {
+            segments.push({ id: index, text: line, type: state });
+            return;
+        }
+
+        // Logic ตรวจจับ (พยายามจับให้ได้มากที่สุดก่อน แต่ถ้า user คลิกจะ override ทันที)
+        if (state === 'story') {
+            if (/<think>/i.test(text)) state = 'think';
+        } else if (state === 'think') {
+            if (/<\/think>/i.test(text)) state = 'story'; 
+        } 
+
+        if (state === 'think' && /<\/think>/i.test(text)) {
+             segments.push({ id: index, text: line, type: 'think' });
+             state = 'story';
+             return;
         }
         
-        if (index === 0 && !isThinking && !startsWithComplexTag) assignedType = 'story';
-
-        return { id: index, text: text, type: assignedType };
+        segments.push({ id: index, text: line, type: state });
     });
+
+    return { segments, isThinkBroken };
 }
 
-function applySplitPoint(startIndex) {
-    currentSegments.forEach((seg) => {
-        if (seg.id < startIndex) {
-            seg.type = 'think';
-        } else {
-            seg.type = 'story';
-        }
-    });
-}
-
-// ฟังก์ชันซ่อม HTML (Whitelist Mode)
-function whitelistFix(text) {
+// Logic แก้ HTML ขั้นสูง
+function advancedHtmlFix(text) {
     if (!text) return "";
-
-    
-    const standardTags = new Set([
-        "a", "abbr", "address", "article", "aside", "audio", "b", "base", "bdi", "bdo", 
-        "blockquote", "body", "br", "button", "canvas", "caption", "cite", "code", "col", 
-        "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", 
-        "dl", "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form", 
-        "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "i", "iframe", 
-        "img", "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map", 
-        "mark", "meta", "meter", "nav", "noscript", "object", "ol", "optgroup", "option", 
-        "output", "p", "param", "picture", "pre", "progress", "q", "rp", "rt", "ruby", "s", 
-        "samp", "script", "section", "select", "small", "source", "span", "strong", "style", 
-        "sub", "summary", "sup", "svg", "table", "tbody", "td", "template", "textarea", 
-        "tfoot", "th", "thead", "time", "title", "tr", "track", "u", "ul", "var", "video", 
-        "wbr", "font", "center", "strike", "tt", "big" 
-    ]);
-
-    const voidTags = new Set([
-        "area", "base", "br", "col", "embed", "hr", "img", "input", 
-        "link", "meta", "param", "source", "track", "wbr"
-    ]);
-
-    const tagRegex = /<\/?([a-zA-Z0-9\.\-\_:]+)[^>]*>/g;
+    const tagRegex = /<(\/?)([a-zA-Z0-9\-\_\.\:]+)([^>]*?)(\/?)>/g;
+    const voidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
     let stack = [];
+    let result = "";
+    let lastIndex = 0;
     let match;
-    
+
     while ((match = tagRegex.exec(text)) !== null) {
         const fullTag = match[0];
-        const tagName = match[1].toLowerCase();
+        const isClose = match[1] === "/";
+        const tagName = match[2].toLowerCase(); 
+        const isSelfClosing = match[4] === "/";
+        const offset = match.index;
 
-        if (!standardTags.has(tagName)) continue; 
-        if (voidTags.has(tagName)) continue;
+        result += text.substring(lastIndex, offset);
+        lastIndex = tagRegex.lastIndex;
 
-        if (fullTag.startsWith("</")) {
-            let foundIndex = -1;
-            for (let i = stack.length - 1; i >= 0; i--) {
-                if (stack[i] === tagName) {
-                    foundIndex = i;
-                    break;
+        if (voidTags.has(tagName) || isSelfClosing) {
+            result += fullTag; continue;
+        }
+
+        if (!isClose) {
+            stack.push(tagName);
+            result += fullTag;
+        } else {
+            if (stack.length > 0) {
+                const top = stack[stack.length - 1];
+                if (top === tagName) {
+                    stack.pop(); result += fullTag;
+                } else {
+                    const foundIndex = stack.lastIndexOf(tagName);
+                    if (foundIndex !== -1) {
+                        while (stack.length > foundIndex + 1) {
+                            const unclosed = stack.pop();
+                            result += `</${unclosed}>`; 
+                        }
+                        stack.pop(); result += fullTag;
+                    }
                 }
             }
-            if (foundIndex !== -1) {
-                stack.splice(foundIndex, stack.length - foundIndex);
-            }
-        } else {
-            stack.push(tagName);
         }
     }
-
-    if (stack.length > 0) {
-        const closingTags = stack.reverse().map(t => `</${t}>`).join("");
-        return text + "\n" + closingTags;
+    result += text.substring(lastIndex);
+    while (stack.length > 0) {
+        const unclosed = stack.pop(); result += `</${unclosed}>`;
     }
-
-    return text;
+    return result;
 }
 
 function countWords(str) {
@@ -119,121 +113,187 @@ function countWords(str) {
     return str.trim().split(/\s+/).length;
 }
 
-// --- 2. Logic: Smart Action ---
-
+// --- 2. Smart Action (Auto Fix) ---
 async function performSmartQuickFix() {
     const context = SillyTavern.getContext();
     const chat = context.chat;
-    if (!chat || chat.length === 0) return toastr.warning("No messages to fix.");
+    if (!chat || chat.length === 0) return toastr.warning("No messages.");
 
     const lastIndex = chat.length - 1;
     const originalText = chat[lastIndex].mes;
+    const hasOpenThink = /<think>/i.test(originalText);
+    const hasCloseThink = /<\/think>/i.test(originalText);
+    
+    // ถ้า Think พัง -> บังคับเปิด Editor
+    if (hasOpenThink && !hasCloseThink) {
+        toastr.warning("Think is broken! Please click where the Story starts.", "Fix Required");
+        openBlockEditor(); 
+        return;
+    }
 
-    // ตรวจหา <think> หรือ &lt;think
-    const hasThinking = /<think|&lt;think|&lt;\/think|<\/think>/i.test(originalText);
-
-    if (hasThinking) {
-        // กรณีเจอ Think -> บังคับเปิด Editor
-        toastr.info("Thinking process detected! Opening editor...");
-        openSplitEditor(); 
+    const fixedText = advancedHtmlFix(originalText);
+    if (fixedText !== originalText) {
+        chat[lastIndex].mes = fixedText;
+        await context.saveChat();
+        await context.reloadCurrentChat();
+        toastr.success("Fixed!");
     } else {
-        // กรณี HTML ธรรมดา -> ซ่อมเลย
-        const fixedText = whitelistFix(originalText);
-        if (fixedText !== originalText) {
-            chat[lastIndex].mes = fixedText;
-            await context.saveChat();
-            await context.reloadCurrentChat();
-            toastr.success("HTML Fixed automatically!");
-        } else {
-            toastr.success("HTML looks good already.");
-        }
+        toastr.success("Perfect!");
     }
 }
 
 // --- 3. UI Builder ---
 let targetMessageId = null;
 
-const authorConfig = {
-    name: "Zealllll",
-    avatarUrl: "scripts/extensions/third-party/SillyTavern-FixHTML-release/avatar.png"
-};
+const getHeaderHtml = (title, icon) => `
+    <div class="healer-header" style="background: linear-gradient(90deg, var(--lavender-dark, #2a2730) 0%, rgba(42,39,48,0.9) 100%);">
+        <div class="header-brand">
+            <div class="header-icon" style="color: #90caf9;">${icon}</div>
+            <div class="header-text"><span class="title" style="color: #fff;">${title}</span></div>
+        </div>
+        <div class="header-controls">
+             <div class="author-pill" style="border: 1px solid rgba(144, 202, 249, 0.3); background: rgba(0,0,0,0.2);">
+                <img src="${authorConfig.avatarUrl}" onerror="this.style.display='none'" style="border: 1px solid #90caf9;">
+                <span class="author-name" style="color: #90caf9;">${authorConfig.name}</span>
+            </div>
+            <div class="close-btn" onclick="$('#html-healer-modal').remove()" style="margin-left:5px;">
+                <i class="fa-solid fa-xmark"></i>
+            </div>
+        </div>
+    </div>
+`;
 
-function openSplitEditor() {
+// Feature: Split (Highlight)
+function openHighlightFixer() {
     const context = SillyTavern.getContext();
     const chat = context.chat;
-    if (!chat || chat.length === 0) return toastr.warning("No messages to fix.");
-
-    const lastIndex = chat.length - 1;
-    targetMessageId = lastIndex;
-    const originalText = chat[lastIndex].mes;
-    
-    initialSegments = parseSegments(originalText);
-    currentSegments = JSON.parse(JSON.stringify(initialSegments));
+    if (!chat || chat.length === 0) return toastr.warning("No messages.");
+    targetMessageId = chat.length - 1;
+    const originalText = chat[targetMessageId].mes;
 
     const modalHtml = `
     <div id="html-healer-modal" class="html-healer-overlay">
-        <div class="html-healer-box">
-            
-            <div class="healer-header">
-                <div class="header-brand">
-                    <div class="header-icon"><i class="fa-solid fa-layer-group"></i></div>
-                    <div class="header-text">
-                        <span class="title">Seg. Selector</span>
-                    </div>
-                </div>
-
-                <div class="header-controls">
-                     <button class="reset-btn" id="btn-reset-split" title="Reset">
-                        <i class="fa-solid fa-rotate-left"></i>
-                     </button>
-                     
-                     <div class="author-pill">
-                        <img src="${authorConfig.avatarUrl}" onerror="this.style.display='none'">
-                        <span class="author-name">${authorConfig.name}</span>
-                    </div>
-
-                    <div class="close-btn" onclick="$('#html-healer-modal').remove()">
-                        <i class="fa-solid fa-xmark"></i>
+        <div class="html-healer-box" style="border: 1px solid rgba(144, 202, 249, 0.4); box-shadow: 0 0 20px rgba(144, 202, 249, 0.15);">
+            ${getHeaderHtml("Split (Highlight)", '<i class="fa-solid fa-highlighter"></i>')}
+            <div class="healer-body">
+                <div class="view-section active">
+                    <div class="editor-group main-group" style="border-color: #90caf9;">
+                        <div class="group-toolbar" style="background: rgba(144, 202, 249, 0.1);">
+                            <span class="label" style="color:#90caf9;"><i class="fa-solid fa-i-cursor"></i> Highlight broken part</span>
+                            <div class="toolbar-actions">
+                                <button class="action-btn" id="btn-heal-selection" style="background:#90caf9; color:#222; border:none; font-weight:bold;">
+                                    <i class="fa-solid fa-wand-magic-sparkles"></i> Fix Selection
+                                </button>
+                            </div>
+                        </div>
+                        <textarea id="editor-targeted" placeholder="Message content..." style="font-family: monospace;">${originalText}</textarea>
                     </div>
                 </div>
             </div>
+            <div class="healer-footer">
+                <button id="btn-save-targeted" class="save-button" style="background:#90caf9; color:#222;">
+                    <i class="fa-solid fa-floppy-disk"></i> Save Changes
+                </button>
+            </div>
+        </div>
+    </div>`;
+    $(document.body).append(modalHtml);
 
-            <div class="segment-picker-area">
+    // Prevent button from stealing focus on click
+    $('#btn-heal-selection').on('mousedown', function(e) { e.preventDefault(); });
+
+    $('#btn-heal-selection').on('click', () => {
+        const textarea = document.getElementById('editor-targeted');
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        if (start === end) return toastr.warning("Please highlight code first!");
+        
+        const fullText = textarea.value;
+        const selectedText = fullText.substring(start, end);
+        const fixedSegment = advancedHtmlFix(selectedText);
+        
+        if (fixedSegment === selectedText) { toastr.info("Selection looks valid."); return; }
+        
+        const newText = fullText.substring(0, start) + fixedSegment + fullText.substring(end);
+        $(textarea).val(newText).trigger('input'); 
+        textarea.setSelectionRange(start, start + fixedSegment.length);
+        textarea.focus();
+        toastr.success("Fixed!");
+    });
+
+    $('#btn-save-targeted').on('click', async () => {
+        chat[targetMessageId].mes = $('#editor-targeted').val();
+        await context.saveChat();
+        await context.reloadCurrentChat();
+        $('#html-healer-modal').remove();
+    });
+}
+
+// Feature: Editor (Blocks - Clean Cut Logic - UPDATED)
+function openBlockEditor() {
+    const context = SillyTavern.getContext();
+    const chat = context.chat;
+    if (!chat || chat.length === 0) return toastr.warning("No messages.");
+
+    targetMessageId = chat.length - 1;
+    const originalText = chat[targetMessageId].mes;
+    
+    // Parse
+    const parseResult = parseSegments(originalText);
+    initialSegments = parseResult.segments;
+    currentSegments = JSON.parse(JSON.stringify(initialSegments));
+    
+    const modalHtml = `
+    <div id="html-healer-modal" class="html-healer-overlay">
+        <div class="html-healer-box" style="border: 1px solid rgba(144, 202, 249, 0.4); box-shadow: 0 0 20px rgba(144, 202, 249, 0.15);">
+            
+            <div class="healer-header" style="background: linear-gradient(90deg, var(--lavender-dark, #2a2730) 0%, rgba(42,39,48,0.9) 100%);">
+                <div class="header-brand">
+                    <div class="header-icon" style="color: #90caf9;"><i class="fa-solid fa-layer-group"></i></div>
+                    <div class="header-text"><span class="title" style="color: #fff;">Editor (Clean Cut)</span></div>
+                </div>
+                <div class="header-controls">
+                    <button class="reset-btn" id="btn-reset-split" title="Reset" style="margin-right:5px;"><i class="fa-solid fa-rotate-left"></i></button>
+                     <div class="author-pill" style="border: 1px solid rgba(144, 202, 249, 0.3); background: rgba(0,0,0,0.2);">
+                        <img src="${authorConfig.avatarUrl}" onerror="this.style.display='none'" style="border: 1px solid #90caf9;">
+                        <span class="author-name" style="color: #90caf9;">${authorConfig.name}</span>
+                    </div>
+                    <div class="close-btn" onclick="$('#html-healer-modal').remove()" style="margin-left:5px;"><i class="fa-solid fa-xmark"></i></div>
+                </div>
+            </div>
+
+            <div class="segment-picker-area" style="background: rgba(0,0,0,0.2);">
                 <div class="segment-scroller" id="segment-container"></div>
-                <div class="picker-instruction">
-                    <i class="fa-solid fa-arrow-pointer"></i> คลิกบรรทัดที่เป็น <b>"จุดเริ่มเนื้อเรื่อง"</b>
+                <div class="picker-instruction" style="background: rgba(30,30,40,0.9); border-top: 1px solid #444;">
+                    <span style="color:#a5d6a7; font-weight:bold;">
+                        <i class="fa-solid fa-arrow-pointer"></i> Click on the first Story line (Everything above becomes Think)
+                    </span>
                 </div>
             </div>
             
             <div class="healer-body">
                 <div id="view-editor" class="view-section active">
-                    <div class="editor-group think-group">
-                        <div class="group-toolbar">
-                            <span class="label"><i class="fa-solid fa-brain"></i> Thinking</span>
-                            <div class="toolbar-actions">
-                                <span class="word-count" id="count-cot">0w</span>
-                                <button class="action-btn" onclick="copyText('editor-cot')"><i class="fa-regular fa-copy"></i></button>
-                            </div>
+                    <div class="editor-group think-group" style="border-color: #2196f3;">
+                        <div class="group-toolbar" style="background: rgba(33, 150, 243, 0.15);">
+                            <span class="label" style="color:#64b5f6;"><i class="fa-solid fa-brain"></i> Thinking (Blue)</span>
+                            <span class="word-count" id="count-cot" style="color:#90caf9;">0w</span>
                         </div>
-                        <textarea id="editor-cot" placeholder="Thinking process..."></textarea>
+                        <textarea id="editor-cot" placeholder="Thinking process..." style="border-left: 2px solid #2196f3;"></textarea>
                     </div>
 
-                    <div class="editor-group main-group">
-                        <div class="group-toolbar">
-                            <span class="label"><i class="fa-solid fa-comments"></i> Story</span>
-                            <div class="toolbar-actions">
-                                <span class="word-count" id="count-main">0w</span>
-                                <button class="action-btn" id="btn-heal-html"><i class="fa-solid fa-wand-magic-sparkles"></i> Fix</button>
-                            </div>
+                    <div class="editor-group main-group" style="border-color: #66bb6a;">
+                        <div class="group-toolbar" style="background: rgba(76, 175, 80, 0.15);">
+                            <span class="label" style="color:#81c784;"><i class="fa-solid fa-comments"></i> Story (Green)</span>
+                            <span class="word-count" id="count-main" style="color:#a5d6a7;">0w</span>
                         </div>
-                        <textarea id="editor-main" placeholder="Story content..."></textarea>
+                        <textarea id="editor-main" placeholder="Story content..." style="border-left: 2px solid #66bb6a;"></textarea>
                     </div>
                 </div>
             </div>
 
             <div class="healer-footer">
-                <button id="btn-save-split" class="save-button">
-                    <span class="btn-content"><i class="fa-solid fa-floppy-disk"></i> Save Changes</span>
+                <button id="btn-save-split" class="save-button" style="background:#64b5f6; color:#111;">
+                    <i class="fa-solid fa-floppy-disk"></i> Merge & Save
                 </button>
             </div>
         </div>
@@ -243,32 +303,42 @@ function openSplitEditor() {
     $(document.body).append(modalHtml);
     renderSegments();
 
-    $('#segment-container').on('click', '.segment-block', function() {
-        const id = $(this).data('id');
-        applySplitPoint(id); 
+    
+    $('#segment-container').on('click', '.segment-block', function(e) {
+        const clickedId = $(this).data('id');
+        
+        currentSegments.forEach(seg => {
+            if (seg.id < clickedId) {
+                seg.type = 'think';
+            } else {
+                seg.type = 'story'; 
+            }
+        });
         renderSegments(); 
     });
 
     $('#btn-reset-split').on('click', () => {
         currentSegments = JSON.parse(JSON.stringify(initialSegments));
         renderSegments();
-        toastr.info("Reset to initial detection.");
-    });
-
-    $('#btn-heal-html').on('click', () => {
-        let val = $('#editor-main').val();
-        let fixed = whitelistFix(val);
-        $('#editor-main').val(fixed).trigger('input');
-        toastr.success("Standard Tags Fixed!");
     });
 
     $('#editor-cot, #editor-main').on('input', updateCounts);
 
     $('#btn-save-split').on('click', async () => {
-        const cot = $('#editor-cot').val().trim();
-        const main = $('#editor-main').val();
-        let finalMes = cot ? `<think>\n${cot}\n</think>\n${main}` : main;
+        let cot = $('#editor-cot').val().trim();
+        let main = $('#editor-main').val().trim();
+        
+        let parts = [];
+        if (cot) {
+            // ห่อ Think ให้อัตโนมัติถ้าไม่มี
+            if (!/^<think>/i.test(cot)) cot = `<think>\n${cot}`;
+            if (!/<\/think>$/i.test(cot)) cot = `${cot}\n</think>`;
+            parts.push(cot);
+        }
+        
+        if (main) parts.push(main);
 
+        const finalMes = parts.join('\n\n');
         if (chat[targetMessageId].mes !== finalMes) {
             chat[targetMessageId].mes = finalMes;
             await context.saveChat();
@@ -283,27 +353,43 @@ function renderSegments() {
     const container = $('#segment-container');
     container.empty();
     
-    currentSegments.forEach(seg => {
-        const isThink = seg.type === 'think';
-        const icon = isThink ? '<i class="fa-solid fa-brain"></i>' : '<i class="fa-solid fa-comment"></i>';
-        
+    // หาจุดเริ่มต้น Story ตัวแรกเพื่อแปะป้าย Badge
+    const firstStoryIndex = currentSegments.findIndex(s => s.type === 'story');
+
+    currentSegments.forEach((seg, index) => {
+        let icon = '<i class="fa-solid fa-comment"></i>';
+        let style = '';
+        let isStartStory = (index === firstStoryIndex);
+
+        if (seg.type === 'think') { 
+            icon = '<i class="fa-solid fa-brain"></i>'; 
+            // BLUE STYLE
+            style = 'border-left: 3px solid #2196f3; background: rgba(33, 150, 243, 0.1); color: #90caf9; opacity: 0.7;';
+        } else {
+            // GREEN STYLE
+            icon = '<i class="fa-solid fa-comment"></i>';
+            style = 'border-left: 3px solid #4caf50; background: rgba(76, 175, 80, 0.1); color: #a5d6a7;';
+        } 
+
         container.append(`
-            <div class="segment-block type-${seg.type}" data-id="${seg.id}">
-                <div class="seg-icon">${icon}</div>
-                <div class="seg-text">${seg.text.substring(0, 60)}...</div>
-                ${!isThink ? '<div class="seg-badge">Start</div>' : ''} 
+            <div class="segment-block" data-id="${seg.id}" style="${style} margin-bottom:2px; padding:8px; border-radius:4px; display:flex; align-items:center; cursor:pointer;">
+                <div class="seg-icon" style="margin-right:10px; opacity:0.8;">${icon}</div>
+                <div class="seg-text" style="flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-family:monospace; font-size:0.9em;">
+                    ${seg.text.substring(0, 60) || "(empty line)"}
+                </div>
+                ${isStartStory ? '<div class="seg-badge" style="background:#98c379; color:#222; font-size:0.7em; padding:1px 5px; border-radius:4px; font-weight:bold;">Start Story</div>' : ''}
             </div>
         `);
     });
-    
-    $('.seg-badge').hide();
-    $('.segment-block.type-story').first().find('.seg-badge').show();
 
     const thinkText = currentSegments.filter(s => s.type === 'think').map(s => s.text).join('\n');
     const storyText = currentSegments.filter(s => s.type === 'story').map(s => s.text).join('\n');
     
     $('#editor-cot').val(thinkText);
     $('#editor-main').val(storyText);
+    
+    if (!thinkText) $('.think-group').hide(); else $('.think-group').show();
+    
     updateCounts();
 }
 
@@ -312,16 +398,9 @@ const updateCounts = () => {
     $('#count-main').text(countWords($('#editor-main').val()) + "w");
 };
 
-window.copyText = (id) => {
-    const el = document.getElementById(id);
-    el.select(); navigator.clipboard.writeText(el.value);
-    toastr.success("Copied!");
-};
-
 function loadSettings() {
     if ($('.html-healer-settings').length > 0) return;
     
-    // สร้าง 2 ปุ่ม: Quick Fix และ Open Editor
     $('#extensions_settings').append(`
         <div class="html-healer-settings">
             <div class="inline-drawer">
@@ -331,166 +410,26 @@ function loadSettings() {
                 </div>
                 <div class="inline-drawer-content">
                     <div class="styled_description_block">Editor by ${authorConfig.name}</div>
-                    
                     <div style="display:flex; gap:5px; margin-top:5px;">
                         <div id="html-healer-quick-fix" class="menu_button" style="flex:1; background-color: var(--smart-theme-color, #4caf50);">
-                            <i class="fa-solid fa-wand-magic-sparkles"></i> Quick Fix
+                            <i class="fa-solid fa-wand-magic-sparkles"></i> Auto
                         </div>
-                        <div id="html-healer-open-split" class="menu_button" style="flex:1;">
+                        <div id="html-healer-open-editor" class="menu_button" style="flex:1;">
                             <i class="fa-solid fa-layer-group"></i> Editor
                         </div>
+                        <div id="html-healer-open-split" class="menu_button" style="flex:1;">
+                            <i class="fa-solid fa-highlighter"></i> Split
+                        </div>
                     </div>
-                    <small style="opacity:0.6; display:block; margin-top:5px; text-align:center;">*Quick fix will open editor if &lt;think&gt; detected.</small>
                 </div>
             </div>
         </div>
     `);
     
-    $('#html-healer-open-split').on('click', openSplitEditor);
     $('#html-healer-quick-fix').on('click', performSmartQuickFix);
+    $('#html-healer-open-editor').on('click', openBlockEditor);
+    $('#html-healer-open-split').on('click', openHighlightFixer);
 }
-
-// --- CSS UPDATED ---
-const styles = `
-<style>
-:root {
-    --lavender-primary: #dcd6f7;
-    --lavender-secondary: #a6b1e1;
-    --lavender-border: rgba(166, 177, 225, 0.2);
-    --lavender-dark: #2a2730;
-    --lavender-darker: #1e1b24;
-    --lavender-text: #f4f4f8;
-}
-
-.html-healer-box * { box-sizing: border-box; }
-.html-healer-overlay {
-    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-    z-index: 99999; background: rgba(0,0,0,0.85);
-    display: flex; align-items: center; justify-content: center;
-    backdrop-filter: blur(4px);
-    padding: 10px;
-}
-
-.html-healer-box {
-    width: 100%; max-width: 900px; height: 90vh;
-    background: var(--lavender-darker);
-    border: 1px solid var(--lavender-border);
-    border-radius: 12px;
-    display: flex; flex-direction: column;
-    box-shadow: 0 0 30px rgba(0,0,0,0.6);
-    overflow: hidden;
-}
-
-/* HEADER */
-.healer-header {
-    background: var(--lavender-dark); padding: 5px 10px;
-    display: flex; justify-content: space-between; align-items: center;
-    border-bottom: 1px solid var(--lavender-border); height: 55px; flex-shrink: 0;
-}
-.header-brand { display: flex; gap: 8px; align-items: center; }
-.header-icon { font-size: 1.1em; color: var(--lavender-secondary); }
-.header-text .title { font-weight: bold; color: var(--lavender-text); font-size: 0.9em; }
-
-/* CONTROLS (Right Side) - FIX ALIGNMENT */
-.header-controls { 
-    display: flex; gap: 8px; align-items: center; margin-left: auto; 
-    flex-shrink: 0; 
-}
-.close-btn { 
-    cursor: pointer; padding: 5px; color: var(--lavender-text); font-size: 1.2em;
-    display: flex; align-items: center; justify-content: center;
-    height: 32px; width: 32px; /* Fix click area size */
-}
-.reset-btn {
-    background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
-    color: #ddd; border-radius: 4px; padding: 0 8px; cursor: pointer; font-size: 0.9em;
-    height: 32px; /* Fix height */
-    display: flex; align-items: center; justify-content: center;
-}
-
-/* AUTHOR PILL - FIXED */
-.author-pill {
-    display: flex; align-items: center; gap: 8px;
-    background: rgba(255, 255, 255, 0.05);
-    padding: 0 10px 0 4px; /* Padding adjustment */
-    border-radius: 16px;
-    border: 1px solid var(--lavender-border);
-    height: 32px; /* Fixed height to match buttons */
-    white-space: nowrap;
-}
-.author-pill img {
-    width: 24px; height: 24px; border-radius: 50%; object-fit: cover;
-    flex-shrink: 0;
-    display: block; /* Remove inline-block spacing issues */
-}
-.author-pill .author-name {
-    font-size: 0.8em; color: var(--lavender-text); font-weight: bold;
-    line-height: 1; /* Reset line-height */
-}
-
-/* SEGMENT PICKER */
-.segment-picker-area {
-    padding: 5px; background: rgba(0,0,0,0.2);
-    border-bottom: 1px solid var(--lavender-border);
-    height: 140px; display: flex; flex-direction: column; gap: 5px;
-}
-.segment-scroller { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; }
-.picker-instruction { font-size: 0.75em; color: #888; text-align: center; }
-
-.segment-block {
-    display: flex; align-items: center; gap: 8px; padding: 8px; 
-    border-radius: 4px; cursor: pointer; border: 1px solid transparent;
-    font-size: 0.8em; background: rgba(255,255,255,0.03);
-    position: relative;
-    min-height: 35px;
-}
-.segment-block.type-think { border-color: var(--lavender-secondary); background: rgba(166, 177, 225, 0.1); opacity: 0.7; }
-.segment-block.type-story { border-color: rgba(152, 195, 121, 0.4); background: rgba(152, 195, 121, 0.1); font-weight: bold;}
-.seg-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #ddd; }
-.seg-badge { background: #98c379; color: #222; font-size: 0.7em; padding: 1px 5px; border-radius: 4px; font-weight: bold; }
-
-/* EDITOR BODY */
-.healer-body { flex: 1; display: flex; overflow: hidden; }
-.view-section { flex: 1; display: flex; flex-direction: column; padding: 5px; gap: 5px; }
-.editor-group { flex: 1; display: flex; flex-direction: column; border: 1px solid var(--lavender-border); border-radius: 6px; }
-.group-toolbar {
-    padding: 5px; background: rgba(0,0,0,0.2);
-    display: flex; justify-content: space-between; align-items: center;
-}
-.label { font-size: 0.8em; font-weight: bold; color: var(--lavender-secondary); }
-.toolbar-actions { display: flex; gap: 5px; align-items: center; }
-.word-count { font-size: 0.65em; color: #666; }
-.action-btn { background: none; border: 1px solid #444; color: #ccc; border-radius: 4px; cursor: pointer; font-size: 0.7em; padding: 2px 5px; }
-textarea { flex: 1; width: 100%; border: none; background: transparent; color: #eee; padding: 8px; resize: none; outline: none; font-family: monospace; font-size: 13px; }
-
-/* FOOTER */
-.healer-footer {
-    padding: 8px 10px; background: var(--lavender-dark);
-    border-top: 1px solid var(--lavender-border);
-    display: flex; justify-content: center; 
-    align-items: center;
-    padding-bottom: max(8px, env(safe-area-inset-bottom));
-}
-.save-button {
-    background: var(--lavender-secondary); color: #222; border: none;
-    padding: 10px 0; 
-    border-radius: 8px; font-weight: bold; cursor: pointer;
-    width: 100%; 
-    font-size: 1em;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-}
-
-/* MOBILE RESPONSIVE TWEAKS */
-@media screen and (max-width: 600px) {
-    .header-brand { display: none; } 
-    .header-controls { width: 100%; justify-content: space-between; }
-    .author-pill { flex: 1; justify-content: center; max-width: none; }
-    .author-pill .author-name { display: inline-block; }
-    .segment-picker-area { height: 150px; }
-}
-</style>
-`;
-$('head').append(styles);
 
 jQuery(async () => {
     loadSettings();
